@@ -212,6 +212,9 @@ def extract_audio_prosody(audio_segment, sr=24000):
         # Duration
         duration = len(audio_segment) / sr
         
+        # Pitch contour (normalized time series for pattern matching)
+        pitch_contour = extract_pitch_contour(audio_segment, sr)
+        
         return {
             "pitch_mean": pitch_mean / 500.0,  # Normalize to 0-1 range
             "pitch_std": pitch_std / 200.0,
@@ -219,14 +222,79 @@ def extract_audio_prosody(audio_segment, sr=24000):
             "tempo": tempo / 200.0,
             "energy_mean": min(energy_mean * 10, 1.0),
             "energy_std": min(energy_std * 10, 1.0),
-            "duration": min(duration / 15.0, 1.0)
+            "duration": min(duration / 15.0, 1.0),
+            "pitch_contour": pitch_contour  # NEW: pitch curve for matching
         }
     except Exception as e:
         logger.warning(f"Audio prosody extraction failed: {e}")
         return {
             "pitch_mean": 0.4, "pitch_std": 0.25, "pitch_range": 0.2,
-            "tempo": 0.6, "energy_mean": 0.3, "energy_std": 0.1, "duration": 0.5
+            "tempo": 0.6, "energy_mean": 0.3, "energy_std": 0.1, "duration": 0.5,
+            "pitch_contour": None
         }
+
+def extract_pitch_contour(audio_segment, sr=24000, n_points=20):
+    """Extract normalized pitch contour as a fixed-length vector."""
+    try:
+        # Use pyin for more robust pitch tracking
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            audio_segment, fmin=50, fmax=500, sr=sr
+        )
+        
+        # Replace NaN with interpolated values
+        f0_clean = np.copy(f0)
+        nans = np.isnan(f0_clean)
+        if np.any(~nans):
+            f0_clean[nans] = np.interp(
+                np.flatnonzero(nans), 
+                np.flatnonzero(~nans), 
+                f0_clean[~nans]
+            )
+        else:
+            return None
+        
+        # Resample to fixed length
+        indices = np.linspace(0, len(f0_clean) - 1, n_points).astype(int)
+        contour = f0_clean[indices]
+        
+        # Normalize to 0-1 range
+        contour_min = np.min(contour)
+        contour_max = np.max(contour)
+        if contour_max > contour_min:
+            contour = (contour - contour_min) / (contour_max - contour_min)
+        else:
+            contour = np.zeros(n_points) + 0.5
+        
+        return contour.tolist()
+    except Exception:
+        return None
+
+def calculate_pitch_contour_similarity(contour1, contour2):
+    """Calculate similarity between two pitch contours using correlation."""
+    if contour1 is None or contour2 is None:
+        return 0.5  # Default medium similarity
+    
+    try:
+        c1 = np.array(contour1)
+        c2 = np.array(contour2)
+        
+        # Ensure same length
+        if len(c1) != len(c2):
+            min_len = min(len(c1), len(c2))
+            c1 = c1[:min_len]
+            c2 = c2[:min_len]
+        
+        # Calculate correlation coefficient
+        if np.std(c1) > 0 and np.std(c2) > 0:
+            correlation = np.corrcoef(c1, c2)[0, 1]
+            # Convert to 0-1 range (correlation is -1 to 1)
+            similarity = (correlation + 1) / 2
+        else:
+            similarity = 0.5
+        
+        return float(similarity)
+    except Exception:
+        return 0.5
 
 def extract_prosody_features(text):
     """Extract prosody-related features from text for similarity matching."""
@@ -460,18 +528,28 @@ def find_best_match(target_text, profile_data):
             
             # Audio prosody bonus (if available)
             audio_bonus = 0.0
+            contour_bonus = 0.0
             if has_audio_prosody and "audio_prosody" in p:
                 audio_p = p["audio_prosody"]
                 # Prefer segments with moderate energy and varied pitch
                 energy_score = 1.0 - abs(audio_p.get("energy_mean", 0.3) - 0.4)
                 pitch_var_score = min(audio_p.get("pitch_std", 0.1) * 2, 0.5)
-                audio_bonus = (energy_score + pitch_var_score) * 0.15
+                audio_bonus = (energy_score + pitch_var_score) * 0.1
+                
+                # Pitch contour similarity bonus (NEW)
+                profile_contour = audio_p.get("pitch_contour")
+                if profile_contour:
+                    # Match question intonation (rising) or statement (falling)
+                    is_rising = profile_contour[-1] > profile_contour[0] if len(profile_contour) > 1 else False
+                    target_is_question = target_features.get("is_question", False)
+                    if is_rising == target_is_question:
+                        contour_bonus = 0.15  # Bonus for matching intonation pattern
             
             # Style bonus (secondary)
             style_bonus = 0.2 if p.get("style_fast") == target_style else 0.0
             
             # Combined score
-            total_score = text_sim + audio_bonus + style_bonus
+            total_score = text_sim + audio_bonus + contour_bonus + style_bonus
             scored_items.append((p, total_score, text_sim))
             
         except Exception:
@@ -537,6 +615,26 @@ def process_video_upload(video_file):
     yield audio_path, raw_text, corrected_text, "⏳ Text corrected. Caching voice..."
     cache_status = cache_speaker_embedding(audio_path, corrected_text)
     yield audio_path, raw_text, corrected_text, cache_status
+
+def trim_trailing_audio(audio_data, sr, max_samples):
+    """Trim trailing audio to remove garbage at the end."""
+    # First, limit to max length
+    trimmed = audio_data[:max_samples]
+    
+    # Then find last significant audio (above threshold)
+    threshold = 0.01  # Audio amplitude threshold
+    abs_audio = np.abs(trimmed)
+    
+    # Find last sample above threshold
+    above_threshold = np.where(abs_audio > threshold)[0]
+    if len(above_threshold) > 0:
+        last_significant = above_threshold[-1]
+        # Add 0.2 second buffer after last significant audio
+        buffer_samples = int(sr * 0.2)
+        end_point = min(last_significant + buffer_samples, len(trimmed))
+        return trimmed[:end_point]
+    
+    return trimmed
 
 def split_sentences(text):
     """Split text into sentences for per-sentence generation."""
@@ -613,6 +711,14 @@ def generate_voice_clone(ref_audio, ref_text, target_text):
             if len(audio_data.shape) > 1:
                 audio_data = audio_data.flatten()
             
+            # Trim trailing audio based on expected duration
+            # Japanese: roughly 0.15-0.2 seconds per character
+            expected_duration = len(sentence) * 0.2  # seconds
+            max_samples = int(expected_duration * sample_rate * 1.5)  # 1.5x buffer
+            if len(audio_data) > max_samples:
+                # Trim to expected length + find last significant audio
+                audio_data = trim_trailing_audio(audio_data, sample_rate, max_samples)
+            
             all_audio.append(audio_data)
             log_parts.append(f"[{i+1}] {reason[:30]}")
         
@@ -684,6 +790,13 @@ def generate_single_segment(ref_audio, ref_text, target_text):
                 audio_data = audio_data.cpu().numpy()
             if len(audio_data.shape) > 1:
                 audio_data = audio_data.flatten()
+            
+            # Trim trailing audio based on expected duration
+            expected_duration = len(target_text) * 0.2
+            max_samples = int(expected_duration * sample_rate * 1.5)
+            if len(audio_data) > max_samples:
+                audio_data = trim_trailing_audio(audio_data, sample_rate, max_samples)
+            
             sf.write(output_path, audio_data, samplerate=sample_rate)
         else:
             if isinstance(result, list):
