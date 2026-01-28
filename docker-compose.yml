@@ -1,0 +1,22 @@
+services:
+  tts-app:
+    build: .
+    container_name: qwen3-tts-app
+    ports:
+      - "7860:7860"
+    volumes:
+      - .:/app
+      - hf_cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ipc: host
+    command: python app.py
+    restart: unless-stopped
+
+volumes:
+  hf_cache:

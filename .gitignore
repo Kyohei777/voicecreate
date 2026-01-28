@@ -1,0 +1,31 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Docker volumes
+hf_cache/
+
+# Saved voices (user profiles - not committed)
+saved_voices/
+
+# Temp files
+*.wav
+*.mp3
+*.mp4
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
