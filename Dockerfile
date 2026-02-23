@@ -19,12 +19,14 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3 /usr/bin/python
 
-# Upgrade pip
-RUN pip3 install --no-cache-dir --upgrade pip
+# Upgrade pip and build tools
+RUN pip3 install --no-cache-dir --upgrade pip ninja packaging psutil wheel
 
 # Install PyTorch with CUDA 12.8 support (for Blackwell sm_120)
 RUN pip3 install --no-cache-dir \
     torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# Removed flash-attn to avoid heavy compilation overhead and WSL crashes
 
 # Install other Python dependencies
 RUN pip3 install --no-cache-dir \
@@ -34,7 +36,8 @@ RUN pip3 install --no-cache-dir \
     gradio \
     faster-whisper \
     soundfile \
-    librosa
+    librosa \
+    bitsandbytes
 
 # Set default command
 CMD ["python", "app.py"]

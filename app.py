@@ -44,17 +44,23 @@ def load_model():
     
     try:
         logger.info(f"Loading Qwen3-TTS: {MODEL_ID}...")
-        model = Qwen3TTSModel.from_pretrained(MODEL_ID)
+        model = Qwen3TTSModel.from_pretrained(
+            MODEL_ID,
+            torch_dtype=torch.float16 if device=="cuda" else torch.float32,
+            device_map="auto"
+        )
         
         logger.info("Loading Whisper (large-v3)...")
         whisper_model = WhisperModel("large-v3", device=device, compute_type="float16" if device=="cuda" else "int8")
         
-        logger.info(f"Loading LLM: {LLM_MODEL_ID}...")
+        logger.info(f"Loading LLM: {LLM_MODEL_ID} (8-bit quantized)...")
         llm_tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_ID)
         llm_model = AutoModelForCausalLM.from_pretrained(
             LLM_MODEL_ID,
             torch_dtype=torch.float16,
-            device_map="auto"
+            device_map="auto",
+            load_in_8bit=True if device=="cuda" else False,
+            low_cpu_mem_usage=True
         )
         
         return "✅ All models loaded successfully!"
@@ -425,7 +431,7 @@ def analyze_full_video(video_path, profile_name, progress=gr.Progress()):
             yield "❌ No high-quality segments found. Try a cleaner audio source.", []
             return
             
-        logger.info(f"Found {len(target_segments)} high-quality segments (SNR >= 15dB)")
+        logger.info(f"Found {len(target_segments)} high-quality segments (SNR >= 2dB)")
             
     except Exception as e:
         yield f"❌ Segmentation error: {e}", []
@@ -439,6 +445,9 @@ def analyze_full_video(video_path, profile_name, progress=gr.Progress()):
         yield f"⏳ Step 3/5: Analyzing segment {i+1}...", []
         
         seg_audio = y[start:end]
+        # Clean up prompt audio (remove silence/noise at edges)
+        seg_audio = cleanup_voice_prompt(seg_audio, sr)
+
         # Memory-based processing roughly, but Qwen needs file path sometimes.
         # We will overwrite the same temp file to save space? No, parallel needs distinct.
         # But we are serial here.
@@ -519,6 +528,31 @@ def find_best_match(target_text, profile_data):
     
     for p in profile_data:
         try:
+            # --- Quality Check (Anti-Hallucination) ---
+            # Check character rate (characters per second)
+            # Normal Japanese speech is ~10-20 chars/sec? No, closer to 5-10 chars/sec.
+            # If audio is long but text is short, it likely contains silence or extra speech.
+            p_text = p.get("text", "")
+            p_audio = p.get("audio") # Not available here usually? prompt is here.
+            # We can rely on stored features if available, or approximate.
+            # Actually, let's use the 'prosody' duration if available.
+            p_prosody = p.get("prosody", {})
+            
+            # Simple heuristic: If text is very short (< 5 chars) but tagged as high quality, be careful.
+            if len(p_text) < 4: 
+                continue
+
+            # --- NG Word Filter (Anti-Hallucination) ---
+            # If reference text contains problematic phrases, skip it.
+            # Ideally this should be done during profiling, but here is safer for existing profiles.
+            ng_words = ["が求められています", "ができます", "思いますか", "そうですね"]
+            if any(ng in p_text for ng in ng_words):
+                 # Only skip if the target text DOES NOT contain these words
+                 # If target has them, it's fine to use them.
+                 target_has_word = any(ng in target_text for ng in ng_words)
+                 if not target_has_word:
+                     continue
+
             profile_features = p.get("prosody", {})
             if not profile_features:
                 continue
@@ -531,6 +565,16 @@ def find_best_match(target_text, profile_data):
             contour_bonus = 0.0
             if has_audio_prosody and "audio_prosody" in p:
                 audio_p = p["audio_prosody"]
+                
+                # Check Duration vs Text Length Ratio
+                # If duration is 5s but text is "はい", ratio is 0.4 chars/sec (Suspicious)
+                duration = audio_p.get("duration", 0) * 15.0 # Denormalize (approx)
+                if duration > 0:
+                    char_rate = len(p_text) / duration
+                    # Threshold: Less than 2 chars/sec is very suspicious for Japanese
+                    if char_rate < 2.0:
+                        continue 
+                
                 # Prefer segments with moderate energy and varied pitch
                 energy_score = 1.0 - abs(audio_p.get("energy_mean", 0.3) - 0.4)
                 pitch_var_score = min(audio_p.get("pitch_std", 0.1) * 2, 0.5)
@@ -574,6 +618,10 @@ def find_best_match(target_text, profile_data):
     if target_features.get('is_exclaim'):
         match_info += " [感嘆文]"
     
+    # Add reference text snippet for debugging
+    ref_text_full = best_item.get("text", "")
+    match_info += f"\nRef({len(ref_text_full)}moji): {ref_text_full}"
+    
     return best_item, match_info
 
 
@@ -616,48 +664,93 @@ def process_video_upload(video_file):
     cache_status = cache_speaker_embedding(audio_path, corrected_text)
     yield audio_path, raw_text, corrected_text, cache_status
 
-def trim_trailing_audio(audio_data, sr, max_samples):
-    """Trim trailing audio to remove garbage at the end."""
-    # First, limit to max length
-    trimmed = audio_data[:max_samples]
-    
-    # Then find last significant audio (above threshold)
-    threshold = 0.01  # Audio amplitude threshold
-    abs_audio = np.abs(trimmed)
-    
-    # Find last sample above threshold
-    above_threshold = np.where(abs_audio > threshold)[0]
-    if len(above_threshold) > 0:
-        last_significant = above_threshold[-1]
-        # Add 0.2 second buffer after last significant audio
-        buffer_samples = int(sr * 0.2)
-        end_point = min(last_significant + buffer_samples, len(trimmed))
-        return trimmed[:end_point]
-    
-    return trimmed
+    yield audio_path, raw_text, corrected_text, cache_status
+
+def cleanup_voice_prompt(audio_data, sr=24000, threshold_db=30):
+    """
+    Aggressively clean up voice prompt audio to prevent trailing garbage generation.
+    Trims silence from both ends and ensures clean cut.
+    """
+    try:
+        # Use librosa to split non-silent parts
+        intervals = librosa.effects.split(audio_data, top_db=threshold_db)
+        clean_audio = audio_data
+        
+        if len(intervals) > 0:
+            # Take the range from start of first interval to end of last interval
+            start = intervals[0][0]
+            end = intervals[-1][1]
+            
+            # Add a tiny fade-out at the end to prevent clicking
+            clean_audio = audio_data[start:end]
+            if len(clean_audio) > 1000:
+                fade_len = 500
+                fade = np.linspace(1.0, 0.0, fade_len)
+                clean_audio[-fade_len:] *= fade
+        
+        # Add silence padding to both ends (Strong Stop Signal)
+        # 0.1s at start, 0.2s at end
+        pad_start = np.zeros(int(sr * 0.1), dtype=np.float32)
+        pad_end = np.zeros(int(sr * 0.2), dtype=np.float32)
+        
+        return np.concatenate([pad_start, clean_audio, pad_end])
+
+    except Exception as e:
+        logger.warning(f"Voice prompt cleanup failed: {e}")
+        return audio_data
+
+def adjust_audio_speed(audio_data, sr, speed):
+    """Adjust audio playback speed without changing pitch."""
+    try:
+        # Use librosa's time stretch (faster = higher rate)
+        stretched = librosa.effects.time_stretch(audio_data, rate=speed)
+        return stretched.astype(np.float32)
+    except Exception as e:
+        logger.warning(f"Speed adjustment failed: {e}")
+        return audio_data
 
 def split_sentences(text):
     """Split text into sentences for per-sentence generation."""
     import re
-    # Split on Japanese sentence endings
-    sentences = re.split(r'([。！？\n]+)', text)
+    # Clean newlines first
+    text = text.replace("\n", "").strip()
     
-    # Recombine sentences with their punctuation
+    # Split specifically on strong sentence endings, not commas
+    sentences = re.split(r'([。！？]+)', text)
+    
+    # Recombine sentences with their endings
     result = []
     i = 0
     while i < len(sentences):
         sentence = sentences[i].strip()
         if sentence:
-            # Check if next element is punctuation
-            if i + 1 < len(sentences) and re.match(r'^[。！？\n]+$', sentences[i + 1]):
+            if i + 1 < len(sentences) and re.match(r'^[。！？]+$', sentences[i + 1]):
                 sentence += sentences[i + 1]
                 i += 1
             result.append(sentence)
         i += 1
-    
-    return [s for s in result if len(s) > 1]
 
-def generate_voice_clone(ref_audio, ref_text, target_text):
+    # Chunking: Merge sentences until chunk is >= 80 chars
+    merged_result = []
+    buffer = ""
+    
+    for s in result:
+        if not s: continue
+        buffer += s
+        if len(buffer) >= 80:
+            merged_result.append(buffer)
+            buffer = ""
+            
+    if buffer:
+        if merged_result and len(buffer) < 20: 
+            # Append very short remainder to previous chunk
+            merged_result[-1] += buffer
+        else:
+            merged_result.append(buffer)
+            
+    return merged_result
+
+def generate_voice_clone(ref_audio, ref_text, target_text, speed=1.0):
     global model, cached_clone_prompt, cached_ref_audio_path, current_profile_data
     
     if model is None:
@@ -671,7 +764,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text):
         
         # If only one sentence or no profile, use original logic
         if len(sentences) <= 1 or not current_profile_data:
-            return generate_single_segment(ref_audio, ref_text, target_text)
+            return generate_single_segment(ref_audio, ref_text, target_text, speed)
         
         logger.info(f"Sentence-level generation: {len(sentences)} sentences")
         
@@ -691,7 +784,10 @@ def generate_voice_clone(ref_audio, ref_text, target_text):
             result = model.generate_voice_clone(
                 text=sentence, 
                 voice_clone_prompt=prompt_to_use, 
-                language="japanese"
+                language="japanese",
+                temperature=0.1,  # Strict mode
+                repetition_penalty=1.0,  # Disable penalty to prevent forced hallucinations
+                top_p=0.7
             )
             
             # Extract audio data
@@ -711,14 +807,6 @@ def generate_voice_clone(ref_audio, ref_text, target_text):
             if len(audio_data.shape) > 1:
                 audio_data = audio_data.flatten()
             
-            # Trim trailing audio based on expected duration
-            # Japanese: roughly 0.15-0.2 seconds per character
-            expected_duration = len(sentence) * 0.2  # seconds
-            max_samples = int(expected_duration * sample_rate * 1.5)  # 1.5x buffer
-            if len(audio_data) > max_samples:
-                # Trim to expected length + find last significant audio
-                audio_data = trim_trailing_audio(audio_data, sample_rate, max_samples)
-            
             all_audio.append(audio_data)
             log_parts.append(f"[{i+1}] {reason[:30]}")
         
@@ -731,6 +819,10 @@ def generate_voice_clone(ref_audio, ref_text, target_text):
                 combined.append(gap)
         
         final_audio = np.concatenate(combined)
+        
+        # Apply speed adjustment if not 1.0
+        if speed != 1.0 and abs(speed - 1.0) > 0.01:
+            final_audio = adjust_audio_speed(final_audio, sample_rate, speed)
         
         # Save
         output_path = "/tmp/generated_voice.wav"
@@ -746,7 +838,7 @@ def generate_voice_clone(ref_audio, ref_text, target_text):
         logger.error(f"Generation error: {e}")
         return None, f"❌ Error: {e}"
 
-def generate_single_segment(ref_audio, ref_text, target_text):
+def generate_single_segment(ref_audio, ref_text, target_text, speed=1.0):
     """Original single-segment generation logic."""
     global model, cached_clone_prompt, cached_ref_audio_path, current_profile_data
     
@@ -758,23 +850,37 @@ def generate_single_segment(ref_audio, ref_text, target_text):
         
         if current_profile_data:
             selected_item, reason = find_best_match(target_text, current_profile_data)
-            prompt_to_use = copy.deepcopy(selected_item["prompt"])
-            log_msg = f"🧠 Smart Match: {reason}\nRef: {selected_item['text'][:20]}..."
-            logger.info(log_msg)
-            
-        elif cached_clone_prompt is not None:
+            if selected_item and "prompt" in selected_item:
+                prompt_to_use = copy.deepcopy(selected_item["prompt"])
+                log_msg = f"🧠 Smart Match: {reason}\nRef: {selected_item.get('text', '')[:20]}..."
+                logger.info(log_msg)
+            else:
+                logger.warning("Smart match failed or no prompt found.")
+                
+        # If smart match failed or not used, try simple cache
+        if prompt_to_use is None and cached_clone_prompt is not None:
             prompt_to_use = copy.deepcopy(cached_clone_prompt)
             log_msg = "⚡ Standard Cache Used"
+
+        # If we have a prompt tensor, generate using IT ONLY.
+        # DO NOT pass ref_audio to avoid re-transcription by the model library.
+        if prompt_to_use:
+             result = model.generate_voice_clone(
+                text=target_text, 
+                voice_clone_prompt=prompt_to_use, 
+                language="japanese",
+                temperature=0.1,  # Strict mode
+                repetition_penalty=1.0, 
+                top_p=0.7  # Stricter sampling
+            )
+        # Only use ref_audio if we DO NOT have a prompt
         elif ref_audio or cached_ref_audio_path:
             audio_to_use = ref_audio if ref_audio else cached_ref_audio_path
+            logger.info("Using Direct Audio (This triggers Whisper...)")
             result = model.generate_voice_clone(text=target_text, ref_audio=audio_to_use, ref_text=ref_text if ref_text else None, language="japanese")
-            prompt_to_use = None 
             log_msg = "🎵 Direct Audio Used"
         else:
             return None, "⚠️ No voice source selected"
-
-        if prompt_to_use:
-             result = model.generate_voice_clone(text=target_text, voice_clone_prompt=prompt_to_use, language="japanese")
         
         output_path = "/tmp/generated_voice.wav"
         
@@ -791,11 +897,9 @@ def generate_single_segment(ref_audio, ref_text, target_text):
             if len(audio_data.shape) > 1:
                 audio_data = audio_data.flatten()
             
-            # Trim trailing audio based on expected duration
-            expected_duration = len(target_text) * 0.2
-            max_samples = int(expected_duration * sample_rate * 1.5)
-            if len(audio_data) > max_samples:
-                audio_data = trim_trailing_audio(audio_data, sample_rate, max_samples)
+            # Apply speed adjustment if not 1.0
+            if speed != 1.0 and abs(speed - 1.0) > 0.01:
+                audio_data = adjust_audio_speed(audio_data, sample_rate, speed)
             
             sf.write(output_path, audio_data, samplerate=sample_rate)
         else:
@@ -910,6 +1014,8 @@ with gr.Blocks(title="Voice Clone Studio Pro", theme=gr.themes.Soft(), css=custo
         with gr.Column(scale=1):
              gr.Markdown("### 3️⃣ Generate Voice")
              target_text = gr.Textbox(label="Target Text", lines=5)
+             with gr.Row():
+                 speed_slider = gr.Slider(minimum=0.7, maximum=1.3, value=1.0, step=0.05, label="🚀 Speech Speed")
              generate_btn = gr.Button("🎵 Generate Voice", variant="primary", size="lg")
         with gr.Column(scale=1):
              gr.Markdown("### 🔊 Result")
@@ -930,8 +1036,8 @@ with gr.Blocks(title="Voice Clone Studio Pro", theme=gr.themes.Soft(), css=custo
     dp_refresh.click(update_voice_list, outputs=[dp_list])
     dp_load_btn.click(load_profile, inputs=[dp_list], outputs=[dp_load_status])
     
-    # Generation
-    generate_btn.click(generate_voice_clone, inputs=[ref_audio, corrected_text, target_text], outputs=[output_audio, output_status])
+    # Generation (added speed_slider)
+    generate_btn.click(generate_voice_clone, inputs=[ref_audio, corrected_text, target_text, speed_slider], outputs=[output_audio, output_status])
 
     # Init
     def init_ui():
